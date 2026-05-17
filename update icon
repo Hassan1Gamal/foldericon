@@ -1,0 +1,268 @@
+import os
+import sys
+import re
+import ctypes
+import threading
+import requests
+import json
+from bs4 import BeautifulSoup
+from PIL import Image, ImageTk
+from io import BytesIO
+import tkinter as tk
+from tkinter import filedialog
+from concurrent.futures import ThreadPoolExecutor # للإسراع
+
+# ==========================================
+# إعدادات Windows
+# ==========================================
+SHCNE_ASSOCCHANGED = 0x08000000
+SHCNF_IDLIST = 0
+SHCNE_UPDATEDIR = 0x00001000
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==========================================
+# 1. تنظيف الاسم
+# ==========================================
+def clean_name_strict(folder_name):
+    folder_name = re.sub(r'\b(1080p|720p|2160p|4K|BluRay|HDR|DVDRip|x264|x265|AAC|HEVC|REPACK|REMUX|WEBRip|WEB-DL)\b', '', folder_name, flags=re.I)
+    folder_name = folder_name.replace('.', ' ').replace('_', ' ')
+    
+    match = re.search(r'^(.*?)(\b(?:19|20)\d{2}\b)', folder_name)
+    if match:
+        name_part = match.group(1).strip()
+        year_part = match.group(2)
+        clean_name = re.sub(r'[^\w\s]', '', name_part)
+        return re.sub(r'\s+', ' ', f"{clean_name} {year_part}").strip()
+    return re.sub(r'[^\w\s]', ' ', folder_name).strip()
+
+# ==========================================
+# 2. بحث DeviantArt (المحسن والسريع جداً)
+# ==========================================
+def search_deviantart(query):
+    clean_query = query.strip()
+    unique_images = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    search_term = clean_query.replace(" ", "+") + "+folder+icon"
+    url = f"https://www.deviantart.com/search?q={search_term}"
+
+    try:
+        session = requests.Session() # استخدام جلسة واحدة لتسريع الطلبات
+        res = session.get(url, headers=headers, timeout=10, verify=False)
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        raw_links = []
+        # استخراج الصور وتجهيز روابطها
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and ('deviantart.net' in src or 'images-wixmp' in src):
+                # تحسين ذكي: تحويل رابط الـ thumb إلى حجم أصلي فوراً دون دخول الصفحة
+                # معظم روابط ديفيانت آرت تسمح بتغيير العرض عبر البارامترات
+                if '/f/' in src:
+                    large_src = re.sub(r'/w_\d+,h_\d+,q_\d+/', '/w_1024,h_1024,q_100/', src)
+                    raw_links.append(large_src)
+                else:
+                    raw_links.append(src)
+
+        # إضافة روابط الـ Art لجمع الصور منها بالتوازي
+        art_pages = []
+        for a in soup.find_all('a', href=True):
+            if '/art/' in a['href'] and a['href'] not in art_pages:
+                art_pages.append(a['href'])
+
+        # دالة سريعة لجلب الصورة من داخل صفحة العمل
+        def fetch_from_art_page(art_url):
+            try:
+                # نكتفي بأول 10 صفحات عمل لتوفير الوقت
+                r = session.get(art_url, headers=headers, timeout=3)
+                s = BeautifulSoup(r.text, 'html.parser')
+                img_tag = s.find('img', {'src': re.compile(r'images-wixmp')})
+                return img_tag['src'] if img_tag else None
+            except: return None
+
+        # تشغيل البحث المتوازي (السرعة القصوى)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(fetch_from_art_page, art_pages[:12]))
+            raw_links.extend([r for r in results if r])
+
+        # تنقية الروابط المكررة
+        for link in raw_links:
+            if link not in unique_images:
+                unique_images.append(link)
+
+    except Exception as e:
+        print("DeviantArt Error:", e)
+
+    # Bing الاحتياطي يبقى كما هو لكن بـ Session
+    if len(unique_images) < 5:
+        try:
+            bing_url = f"https://www.bing.com/images/search?q={clean_query}+folder+icon+deviantart"
+            res = session.get(bing_url, headers=headers, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            for a in soup.find_all('a', class_='iusc'):
+                m = json.loads(a.get('m', '{}'))
+                img_link = m.get('murl')
+                if img_link and img_link not in unique_images:
+                    unique_images.append(img_link)
+        except: pass
+
+    return unique_images[:28]
+
+# ==========================================
+# 3. تطبيق الأيقونة (بدون تغيير)
+# ==========================================
+def process_and_set_icon(img_url, folder_path):
+    try:
+        h = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(img_url, headers=h, timeout=15, verify=False)
+        img = Image.open(BytesIO(r.content))
+
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+
+        width, height = img.size
+        new_size = max(width, height)
+        square_img = Image.new("RGBA", (new_size, new_size), (0, 0, 0, 0))
+        square_img.paste(img, ((new_size - width) // 2, (new_size - height) // 2))
+
+        icon_path = os.path.join(folder_path, "folder.ico")
+        ini_path = os.path.join(folder_path, "desktop.ini")
+
+        for f in [icon_path, ini_path]:
+            if os.path.exists(f):
+                ctypes.windll.kernel32.SetFileAttributesW(f, 128)
+                os.remove(f)
+
+        square_img.save(icon_path, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48)])
+
+        ini_content = "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n[ViewState]\r\nMode=\r\nVid=\r\nFolderType=Videos\r\n"
+        with open(ini_path, 'w', encoding='utf-16') as f:
+            f.write(ini_content)
+
+        ctypes.windll.kernel32.SetFileAttributesW(icon_path, 0x02 | 0x04)
+        ctypes.windll.kernel32.SetFileAttributesW(ini_path, 0x02 | 0x04)
+        ctypes.windll.kernel32.SetFileAttributesW(folder_path, 0x01)
+
+        ctypes.windll.shell32.SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, folder_path, None)
+        ctypes.windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None)
+
+        return True, "Success"
+    except Exception as e:
+        return False, str(e)
+
+# ==========================================
+# 4. الواجهة (المحافظة على التصميم والميزات)
+# ==========================================
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Movie Iconizer Pro - DeviantArt")
+        self.root.geometry("700x500")
+        self.root.configure(bg="#0a0a0a")
+
+        tk.Label(root, text="Movie Folder Iconizer\n(DeviantArt)", font=("Segoe UI", 22, "bold"), bg="#0a0a0a", fg="#00d2d3", justify="center").pack(pady=20)
+
+        f_frame = tk.Frame(root, bg="#0a0a0a")
+        f_frame.pack(fill='x', padx=40)
+        self.path_var = tk.StringVar()
+        tk.Entry(f_frame, textvariable=self.path_var, font=("Consolas", 10), bg="#1a1a1a", fg="#888", bd=0).pack(side="left", fill='x', expand=True, ipady=5)
+        tk.Button(f_frame, text="📂", command=self.browse, bg="#333", fg="white", bd=0, padx=12).pack(side="left", padx=5)
+
+        self.search_var = tk.StringVar()
+        tk.Entry(root, textvariable=self.search_var, font=("Segoe UI", 14, "bold"), bg="#1a1a1a", fg="#fff", justify="center", bd=0).pack(fill='x', padx=40, pady=25, ipady=10)
+
+        self.btn = tk.Button(root, text="🔍 ابحث في DeviantArt", command=self.start_manual,
+                             bg="#00d2d3", fg="#000", font=("Segoe UI", 13, "bold"), height=2, bd=0, cursor="hand2")
+        self.btn.pack(pady=10, fill='x', padx=140)
+
+        self.status = tk.Label(root, text="اختر مجلد → اضغط بحث", bg="#0a0a0a", fg="#666", font=("Segoe UI", 10))
+        self.status.pack(side="bottom", pady=25)
+
+        if len(sys.argv) > 1:
+            self.root.after(500, lambda: self.auto_start(sys.argv[1]))
+
+    def browse(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.prepare(p)
+
+    def prepare(self, path):
+        self.path_var.set(path)
+        cleaned = clean_name_strict(os.path.basename(path))
+        self.search_var.set(cleaned)
+
+    def auto_start(self, path):
+        if os.path.isdir(path):
+            self.prepare(path)
+            self.start_manual()
+
+    def start_manual(self):
+        if not self.path_var.get():
+            return
+        self.btn.config(state="disabled", text="جاري البحث السريع...")
+        threading.Thread(target=self.search_thread, daemon=True).start()
+
+    def search_thread(self):
+        urls = search_deviantart(self.search_var.get())
+        self.root.after(0, lambda: self.btn.config(state="normal", text="🔍 ابحث في DeviantArt"))
+        if urls:
+            self.root.after(0, lambda: ImageGridWindow(self.root, urls, self.path_var.get(), self.apply_icon))
+        else:
+            self.root.after(0, lambda: self.status.config(text="⚠️ لم يتم العثور على نتائج", fg="#ff4d4d"))
+
+    def apply_icon(self, url):
+        self.status.config(text="جاري تطبيق الأيقونة...", fg="#00d2d3")
+        threading.Thread(target=self.apply_thread, args=(url,), daemon=True).start()
+
+    def apply_thread(self, url):
+        ok, msg = process_and_set_icon(url, self.path_var.get())
+        if ok:
+            self.root.after(0, lambda: self.status.config(text="✅ تم التطبيق بنجاح!", fg="#00ff00"))
+            self.root.after(1400, self.root.destroy)
+        else:
+            self.root.after(0, lambda: self.status.config(text=f"❌ {msg}", fg="#ff4d4d"))
+
+
+class ImageGridWindow:
+    def __init__(self, parent, urls, folder_path, callback):
+        self.win = tk.Toplevel(parent)
+        self.win.title("اختر Folder Icon من DeviantArt")
+        self.win.geometry("960x740")
+        self.win.configure(bg="#121212")
+
+        canvas = tk.Canvas(self.win, bg="#121212", highlightthickness=0)
+        scroll = tk.Scrollbar(self.win, orient="vertical", command=canvas.yview)
+        frame = tk.Frame(canvas, bg="#121212")
+
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=20, pady=20)
+        scroll.pack(side="right", fill="y")
+
+        self.photos = []
+        # تحميل الصور في الشبكة باستخدام خيوط معالجة لضمان سلاسة الواجهة
+        for i, url in enumerate(urls):
+            threading.Thread(target=self.load_single_image, args=(url, frame, i, callback), daemon=True).start()
+
+    def load_single_image(self, url, frame, index, callback):
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6, verify=False)
+            pil = Image.open(BytesIO(r.content))
+            pil.thumbnail((205, 205), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(pil)
+            self.photos.append(photo)
+
+            btn = tk.Button(frame, image=photo, bg="#1e1e1e", bd=0, activebackground="#00d2d3",
+                            command=lambda u=url: [self.win.destroy(), callback(u)])
+            btn.grid(row=index//4, column=index%4, padx=10, pady=12)
+        except:
+            pass
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
